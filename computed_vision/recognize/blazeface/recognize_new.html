@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Reconhecimento Facial com BlazeFace + FaceNet ONNX</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface"></script>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    video {
+      transform: scaleX(-1);
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Reconhecimento Facial (CPU, JS)</h2>
+  <div style="display: flex;">
+    <video id="video" width="640" height="480" autoplay muted></video>
+    <canvas id="canvas-realtime" width="640" height="480"></canvas>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <button id="reconhecer" style="position: absolute; top: 10px; left: 10px;">Reconhecer</button>
+
+  </div>
+
+  <script type="module">
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const reconhecer = document.getElementById('reconhecer');
+    const canvasRealTime = document.getElementById('canvas-realtime');
+    const ctx = canvas.getContext('2d');
+    const ctxRealTime = canvasRealTime.getContext('2d');
+    var count = 0;
+
+    let modelBlaze;
+    const shape = 128; // Tamanho da imagem de entrada para o modelo
+    let sessionONNX;
+    const dbEmbeddings = {};
+
+    reconhecer.addEventListener('click', () => {
+      count = 0;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    });
+
+    async function setupCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+      return new Promise(resolve => {
+        video.onloadedmetadata = () => resolve(video);
+      });
+
+    }
+
+    function preprocessFace(img) {
+      return tf.tidy(() => {
+        let resized = tf.image.resizeBilinear(img, [shape, shape]);
+
+        // Converter para escala de cinza (1 canal)
+        // let gray = resized.mean(2).expandDims(2); // Calcula a média dos canais RGB e adiciona o canal
+
+        let normalized = resized.div(127.5).sub(1);
+        // Normalizar para [-1, 1]
+        normalized = normalized.sub(0.5).div(0.5);
+        // HWC -> CHW
+        let transposed = normalized.transpose([2, 0, 1]);
+        let batched = transposed.expandDims(0);
+        return batched;
+      });
+    }
+
+    async function getEmbeddingFromCanvas(faceImage) {
+      const input = preprocessFace(faceImage);
+      const tensor = new ort.Tensor('float32', input.dataSync(), input.shape);
+      const results = await sessionONNX.run({ input: tensor });
+
+      const outputName = Object.keys(results)[0];
+      const embedding = results[outputName].data;// output key pode mudar conforme o modelo
+
+      const norm = Math.sqrt(embedding.reduce((acc, v) => acc + v * v, 0));
+      return embedding.map(x => x / norm);
+    }
+
+    function cosineSim(a, b) {
+      if (a.length !== b.length) {
+        throw new Error('Vetores precisam ter o mesmo tamanho!');
+      }
+
+      let dot = 0.0;
+      let normA = 0.0;
+      let normB = 0.0;
+
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+      }
+
+      if (normA === 0 || normB === 0) {
+        return 0; // Evita divisão por zero
+      }
+
+      return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+
+    async function createEmbeddingDB() {
+      const labels = ['olise', 'victor']; // Altere conforme suas imagens
+      for (const label of labels) {
+        const img = new Image();
+        img.src = `/faces/${label}.png`;
+        await new Promise(res => img.onload = res);
+
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = img.width;
+        tempCanvas.height = img.height;
+        const ctx = tempCanvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+
+        const faces = await modelBlaze.estimateFaces(tempCanvas, false);
+
+        if (faces.length === 0) {
+          console.log(`Nenhum rosto detectado para ${label}.`);
+          continue; // Pula para o próximo label
+        }
+
+        const face = faces[0]; // Considera apenas o primeiro rosto detectado
+        const [x1, y1] = face.topLeft.map(coord => Math.max(0, coord)); // Garante que as coordenadas sejam positivas
+        const [x2, y2] = face.bottomRight.map(coord => Math.min(coord, tempCanvas.width)); // Limita ao tamanho da imagem
+        const width = x2 - x1;
+        const height = y2 - y1;
+
+        const faceTensor = tf.browser.fromPixels(tempCanvas)
+          .slice([parseInt(y1), parseInt(x1), 0], [parseInt(height), parseInt(width), 3]);
+        const embedding = await getEmbeddingFromCanvas(faceTensor);
+        dbEmbeddings[label] = embedding;
+        faceTensor.dispose(); // Libera memória
+      }
+    }
+
+    async function recognition(x, y, w, h) {
+      // if (count > 0) return
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      ctx.strokeStyle = "red";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, w, h);
+
+
+      // Processar o embedding de forma assíncrona
+      const faceTensor = tf.browser.fromPixels(video)
+        .slice([parseInt(y), parseInt(x), 0], [parseInt(h), parseInt(w), 3]);
+
+      const embedding = await getEmbeddingFromCanvas(faceTensor);
+      let bestMatch = "Desconhecido";
+      let bestScore = -1;
+
+      for (const [name, dbEmb] of Object.entries(dbEmbeddings)) {
+        console.log('dbEmb', dbEmb)
+        // const out1 = tf.tensor1d(embedding);
+        // const out2 = tf.tensor1d(dbEmb);
+
+        // const score = out1.dot(out2); // Já faz direto!
+        const score = cosineSim(embedding, dbEmb);
+        console.log('reconhecimento', score)
+        if (score > bestScore && score > 0.8) {
+          bestMatch = name;
+          bestScore = score;
+        }
+      }
+
+      // Atualizar o canvas com o resultado do reconhecimento
+      ctx.fillStyle = "yellow";
+      ctx.fillText(`${bestMatch} (${bestScore.toFixed(2)})`, x, y - 5);
+
+      count = 1
+    }
+
+    async function startRecognition() {
+      modelBlaze = await blazeface.load();
+      sessionONNX = await ort.InferenceSession.create("/models/recognition_resnet27.onnx",
+        { executionProviders: ['wasm'] }
+      );
+
+      await setupCamera();
+      await createEmbeddingDB();
+
+      async function detect() {
+        const predictions = await modelBlaze.estimateFaces(video, false);
+
+        ctxRealTime.clearRect(0, 0, canvas.width, canvas.height);
+        ctxRealTime.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        for (let pred of predictions) {
+          const [x, y] = pred.topLeft;
+          const [x2, y2] = pred.bottomRight;
+          const w = x2 - x;
+          const h = y2 - y;
+
+
+          ctxRealTime.strokeStyle = "red";
+          ctxRealTime.lineWidth = 2;
+          ctxRealTime.fillText(pred.probability[0].toFixed(2), x, y - 10)
+          ctxRealTime.font = "16px Arial";
+          ctxRealTime.fillStyle = "red";
+          ctxRealTime.strokeRect(x, y, w, h);
+
+          recognition(x, y, w, h)
+
+        }
+
+        requestAnimationFrame(detect);
+      }
+
+      detect();
+    }
+
+    startRecognition();
+  </script>
+</body>
+
+</html>

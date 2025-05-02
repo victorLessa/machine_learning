@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>BlazeFace com TensorFlow.js</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+</head>
+
+<body>
+  <h2>Detecção Facial em Tempo Real (BlazeFace)</h2>
+  <video id="video" hidden width="640" height="480" autoplay muted playsinline></video>
+  <canvas id="canvas" width="640" height="480"></canvas>
+  <button id="save" style="display: none;">Salvar Rosto</button>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const faceButton = document.getElementById('save');
+    const ctx = canvas.getContext('2d');
+
+    async function setupCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true
+      });
+      video.srcObject = stream;
+      return new Promise(resolve => {
+        video.onloadedmetadata = () => resolve(video);
+      });
+    }
+
+    async function runFaceDetection() {
+      const model = await blazeface.load();
+      await setupCamera();
+      video.play();
+
+      async function detect() {
+        const returnTensors = false;
+        const predictions = await model.estimateFaces(video, returnTensors);
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        if (predictions.length > 0) {
+          faceButton.style.display = 'block';
+          predictions.forEach(pred => {
+            const [x, y, width, height] = [
+              pred.topLeft[0],
+              pred.topLeft[1],
+              pred.bottomRight[0] - pred.topLeft[0],
+              pred.bottomRight[1] - pred.topLeft[1]
+            ];
+
+            faceButton.onclick = async () => {
+              const tempCanvas = document.createElement('canvas');
+              const tempCtx = tempCanvas.getContext('2d');
+
+              // Ajustar o tamanho do canvas temporário para o tamanho do rosto
+              tempCanvas.width = width;
+              tempCanvas.height = height;
+
+              // Copiar a área do rosto para o canvas temporário
+              tempCtx.drawImage(canvas, x, y, width, height, 0, 0, width, height);
+
+              // Salvar o conteúdo do canvas temporário como uma imagem
+              tempCanvas.toBlob(blob => {
+                saveAs(blob, 'face.png'); // Usando FileSaver.js para salvar
+              }, 'image/png');
+            };
+
+            if (pred.probability < 0.8) {
+              return;
+            }
+            ctx.strokeStyle = "red";
+            ctx.lineWidth = 2;
+            ctx.fillText(pred.probability[0].toFixed(2), x, y - 10)
+            ctx.font = "16px Arial";
+            ctx.fillStyle = "red";
+            ctx.strokeRect(x, y, width, height);
+
+          });
+        } else {
+          faceButton.style.display = 'none';
+        }
+
+        requestAnimationFrame(detect);
+      }
+
+      detect();
+    }
+
+    runFaceDetection();
+  </script>
+</body>
+
+</html>
